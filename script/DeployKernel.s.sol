@@ -11,15 +11,29 @@ contract DeployKernel is Script {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
         address entrypointAddress = vm.envAddress("ENTRYPOINT_ADDRESS");
         
+        console2.log("=== Deployment Configuration ===");
+        console2.log("RPC URL:", vm.rpcUrl("og"));
+        console2.log("Deployer address:", vm.addr(deployerPrivateKey));
+        console2.log("EntryPoint address:", entrypointAddress);
+        console2.log("");
+        
         // Start broadcasting transactions
         vm.startBroadcast(deployerPrivateKey);
         
         // Deploy Kernel contract
         Kernel kernel = new Kernel(IEntryPoint(entrypointAddress));
         
+        console2.log("=== Deployment Result ===");
         console2.log("Kernel deployed at:", address(kernel));
-        console2.log("EntryPoint address:", entrypointAddress);
-        console2.log("Deployer address:", vm.addr(deployerPrivateKey));
+        console2.log("");
+        console2.log("=== Verification Command ===");
+        console2.log("forge verify-contract \\");
+        console2.log("  --chain-id", block.chainid, "\\");
+        console2.log("  --constructor-args", abi.encode(entrypointAddress), "\\");
+        console2.log("  --etherscan-api-key no-key-needed \\");
+        console2.log("  --verifier-url https://chainscan.0g.ai/api \\");
+        console2.log("  ", address(kernel), "\\");
+        console2.log("  src/Kernel.sol:Kernel");
         
         vm.stopBroadcast();
     }
