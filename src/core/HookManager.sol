@@ -4,6 +4,8 @@ pragma solidity ^0.8.0;
 
 import {IHook} from "../interfaces/IERC7579Modules.sol";
 import {ModuleLib} from "../utils/ModuleLib.sol";
+import {IERC7579Account} from "../interfaces/IERC7579Account.sol";
+import {MODULE_TYPE_HOOK} from "../types/Constants.sol";
 
 abstract contract HookManager {
     // NOTE: currently, all install/uninstall calls onInstall/onUninstall
@@ -17,10 +19,10 @@ abstract contract HookManager {
         context = hook.preCheck(msg.sender, value, callData);
     }
 
-    function _doPostHook(IHook hook, bytes memory context, bool success, bytes memory result) internal {
+    function _doPostHook(IHook hook, bytes memory context) internal {
         // bool success,
         // bytes memory result
-        hook.postCheck(context, success, result);
+        hook.postCheck(context);
     }
 
     // @notice if hook is not initialized before, kernel will call hook.onInstall no matter what flag it shows, with hookData[1:]
@@ -29,15 +31,12 @@ abstract contract HookManager {
         if (address(hook) == address(0) || address(hook) == address(1)) {
             return;
         }
-        if (!hook.isInitialized(address(this))) {
+        if (!hook.isInitialized(address(this)) || (hookData.length > 0 && bytes1(hookData[0]) == bytes1(0xff))) {
             // if hook is not installed, it should call onInstall
-            hook.onInstall(hookData[1:]);
-            return;
-        }
-        if (bytes1(hookData[0]) == bytes1(0xff)) {
             // 0xff means you want to explicitly call install hook
             hook.onInstall(hookData[1:]);
         }
+        emit IERC7579Account.ModuleInstalled(MODULE_TYPE_HOOK, address(hook));
     }
 
     // @param hookData encoded as (1bytes flag + actual hookdata) flag is for identifying if the hook has to be initialized or not
@@ -49,5 +48,6 @@ abstract contract HookManager {
             // 0xff means you want to call uninstall hook
             ModuleLib.uninstallModule(address(hook), hookData[1:]);
         }
+        emit IERC7579Account.ModuleUninstalled(MODULE_TYPE_HOOK, address(hook));
     }
 }
