@@ -38,8 +38,17 @@ ValidationMode constant VALIDATION_MODE_INSTALL = ValidationMode.wrap(0x02);
 
 // --- Kernel validation types ---
 ValidationType constant VALIDATION_TYPE_ROOT = ValidationType.wrap(0x00);
+ValidationType constant VALIDATION_TYPE_7702 = ValidationType.wrap(0x00);
 ValidationType constant VALIDATION_TYPE_VALIDATOR = ValidationType.wrap(0x01);
 ValidationType constant VALIDATION_TYPE_PERMISSION = ValidationType.wrap(0x02);
+
+// --- Kernel Hook constants ---
+address constant HOOK_MODULE_NOT_INSTALLED = address(0);
+address constant HOOK_MODULE_INSTALLED = address(1);
+address constant HOOK_ONLY_ENTRYPOINT = address(0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF);
+
+// --- EIP7702 constants ---
+bytes3 constant EIP7702_PREFIX = bytes3(0xef0100);
 
 // --- storage slots ---
 // bytes32(uint256(keccak256('kernel.v3.selector')) - 1)
@@ -51,6 +60,8 @@ bytes32 constant HOOK_MANAGER_STORAGE_SLOT = 0x4605d5f70bb605094b2e761eccdc27bed
 // bytes32(uint256(keccak256('kernel.v3.validation')) - 1)
 bytes32 constant VALIDATION_MANAGER_STORAGE_SLOT = 0x7bcaa2ced2a71450ed5a9a1b4848e8e5206dbc3f06011e595f7f55428cc6f84f;
 bytes32 constant ERC1967_IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+bytes32 constant MAGIC_VALUE_SIG_REPLAYABLE = keccak256("kernel.replayable.signature");
 
 // --- Kernel validation nonce incremental size limit ---
 uint32 constant MAX_NONCE_INCREMENT_SIZE = 10;

@@ -17,12 +17,10 @@ import {
     PassFlag,
     SKIP_SIGNATURE
 } from "./core/ValidationManager.sol";
-import {HookManager} from "./core/HookManager.sol";
-import {ExecutorManager} from "./core/ExecutorManager.sol";
-import {SelectorManager} from "./core/SelectorManager.sol";
 import {IModule, IValidator, IHook, IExecutor, IFallback, IPolicy, ISigner} from "./interfaces/IERC7579Modules.sol";
 import {EIP712} from "solady/utils/EIP712.sol";
-import {ExecLib, ExecMode, CallType, ExecType, ExecModeSelector, ExecModePayload} from "./utils/ExecLib.sol";
+import {ExecLib} from "./utils/ExecLib.sol";
+import {ExecMode, CallType, ExecType, ExecModeSelector, ExecModePayload} from "./types/Types.sol";
 import {
     CALLTYPE_SINGLE,
     CALLTYPE_DELEGATECALL,
@@ -30,20 +28,30 @@ import {
     VALIDATION_TYPE_ROOT,
     VALIDATION_TYPE_VALIDATOR,
     VALIDATION_TYPE_PERMISSION,
+    VALIDATION_TYPE_7702,
     MODULE_TYPE_VALIDATOR,
     MODULE_TYPE_EXECUTOR,
     MODULE_TYPE_FALLBACK,
     MODULE_TYPE_HOOK,
     MODULE_TYPE_POLICY,
     MODULE_TYPE_SIGNER,
+    HOOK_MODULE_NOT_INSTALLED,
+    HOOK_MODULE_INSTALLED,
+    HOOK_ONLY_ENTRYPOINT,
     EXECTYPE_TRY,
     EXECTYPE_DEFAULT,
     EXEC_MODE_DEFAULT,
     CALLTYPE_DELEGATECALL,
     CALLTYPE_SINGLE,
     CALLTYPE_BATCH,
-    CALLTYPE_STATIC
+    CALLTYPE_STATIC,
+    MAGIC_VALUE_SIG_REPLAYABLE,
+    ERC1271_INVALID,
+    ERC1271_MAGICVALUE,
+    EIP7702_PREFIX
 } from "./types/Constants.sol";
+
+import {InstallExecutorDataFormat, InstallFallbackDataFormat, InstallValidatorDataFormat} from "./types/Structs.sol";
 
 contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager {
     error ExecutionReverted();
@@ -54,6 +62,8 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
     error InvalidModuleType();
     error InvalidCaller();
     error InvalidSelector();
+    error InitConfigError(uint256 idx);
+    error AlreadyInitialized();
 
     event Received(address sender, uint256 amount);
     event Upgraded(address indexed implementation);
@@ -75,22 +85,15 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         _;
     }
 
-    modifier onlyEntryPointOrSelf() {
-        if (msg.sender != address(entrypoint) && msg.sender != address(this)) {
-            revert InvalidCaller();
-        }
-        _;
-    }
-
     modifier onlyEntryPointOrSelfOrRoot() {
-        IValidator validator = ValidatorLib.getValidator(_validationStorage().rootValidator);
         if (
             msg.sender != address(entrypoint) && msg.sender != address(this) // do rootValidator hook
         ) {
+            IValidator validator = ValidatorLib.getValidator(_validationStorage().rootValidator);
             if (validator.isModuleType(4)) {
                 bytes memory ret = IHook(address(validator)).preCheck(msg.sender, msg.value, msg.data);
                 _;
-                IHook(address(validator)).postCheck(ret, true, hex""); // TODO don't support try catch hook here
+                IHook(address(validator)).postCheck(ret);
             } else {
                 revert InvalidCaller();
             }
@@ -99,11 +102,17 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         }
     }
 
-    function initialize(ValidationId _rootValidator, IHook hook, bytes calldata validatorData, bytes calldata hookData)
-        external
-    {
+    function initialize(
+        ValidationId _rootValidator,
+        IHook hook,
+        bytes calldata validatorData,
+        bytes calldata hookData,
+        bytes[] calldata initConfig
+    ) external {
         ValidationStorage storage vs = _validationStorage();
-        require(ValidationId.unwrap(vs.rootValidator) == bytes21(0), "already initialized");
+        if (ValidationId.unwrap(vs.rootValidator) != bytes21(0) || bytes3(address(this).code) == EIP7702_PREFIX) {
+            revert AlreadyInitialized();
+        }
         if (ValidationId.unwrap(_rootValidator) == bytes21(0)) {
             revert InvalidValidator();
         }
@@ -115,6 +124,34 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         ValidationConfig memory config = ValidationConfig({nonce: uint32(1), hook: hook});
         vs.currentNonce = 1;
         _installValidation(_rootValidator, config, validatorData, hookData);
+        for (uint256 i = 0; i < initConfig.length; i++) {
+            (bool success,) = address(this).call(initConfig[i]);
+            if (!success) {
+                revert InitConfigError(i);
+            }
+        }
+    }
+
+    function changeRootValidator(
+        ValidationId _rootValidator,
+        IHook hook,
+        bytes calldata validatorData,
+        bytes calldata hookData
+    ) external payable onlyEntryPointOrSelfOrRoot {
+        ValidationStorage storage vs = _validationStorage();
+        if (ValidationId.unwrap(_rootValidator) == bytes21(0)) {
+            revert InvalidValidator();
+        }
+        ValidationType vType = ValidatorLib.getType(_rootValidator);
+        if (vType != VALIDATION_TYPE_VALIDATOR && vType != VALIDATION_TYPE_PERMISSION) {
+            revert InvalidValidationType();
+        }
+        _setRootValidator(_rootValidator);
+        if (_validationStorage().validationConfig[_rootValidator].hook == IHook(HOOK_MODULE_NOT_INSTALLED)) {
+            // when new rootValidator is not installed yet
+            ValidationConfig memory config = ValidationConfig({nonce: uint32(vs.currentNonce), hook: hook});
+            _installValidation(_rootValidator, config, validatorData, hookData);
+        }
     }
 
     function upgradeTo(address _newImplementation) external payable onlyEntryPointOrSelfOrRoot {
@@ -126,45 +163,65 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
 
     function _domainNameAndVersion() internal pure override returns (string memory name, string memory version) {
         name = "Kernel";
-        version = "0.3.0-beta";
+        version = "0.3.3";
     }
 
     receive() external payable {
         emit Received(msg.sender, msg.value);
     }
 
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return this.onERC1155BatchReceived.selector;
+    }
+
     fallback() external payable {
         SelectorConfig memory config = _selectorConfig(msg.sig);
         bool success;
         bytes memory result;
-        if (address(config.hook) == address(0)) {
+        if (address(config.hook) == HOOK_MODULE_NOT_INSTALLED) {
             revert InvalidSelector();
+        }
+        // action installed
+        bytes memory context;
+        if (address(config.hook) == HOOK_ONLY_ENTRYPOINT) {
+            // for selector manager, address(0) for the hook will default to type(address).max,
+            // and this will only allow entrypoints to interact
+            if (msg.sender != address(entrypoint)) {
+                revert InvalidCaller();
+            }
+        } else if (address(config.hook) != HOOK_MODULE_INSTALLED) {
+            context = _doPreHook(config.hook, msg.value, msg.data);
+        }
+        // execute action
+        if (config.callType == CALLTYPE_SINGLE) {
+            (success, result) = ExecLib.doFallback2771Call(config.target);
+        } else if (config.callType == CALLTYPE_DELEGATECALL) {
+            (success, result) = ExecLib.executeDelegatecall(config.target, msg.data);
         } else {
-            // action installed
-            bytes memory context;
-            if (address(config.hook) != address(1)) {
-                context = _doPreHook(config.hook, msg.value, msg.data);
-            }
-            // execute action
-            if (config.callType == CALLTYPE_SINGLE) {
-                (success, result) = ExecLib.doFallback2771Call(config.target);
-            } else if (config.callType == CALLTYPE_DELEGATECALL) {
-                (success, result) = ExecLib.executeDelegatecall(config.target, msg.data);
-            } else {
-                revert NotSupportedCallType();
-            }
-            if (address(config.hook) != address(1)) {
-                _doPostHook(config.hook, context, success, result);
-            }
+            revert NotSupportedCallType();
         }
         if (!success) {
             assembly {
                 revert(add(result, 0x20), mload(result))
             }
-        } else {
-            assembly {
-                return(add(result, 0x20), mload(result))
-            }
+        }
+        if (address(config.hook) != HOOK_MODULE_INSTALLED && address(config.hook) != HOOK_ONLY_ENTRYPOINT) {
+            _doPostHook(config.hook, context);
+        }
+        assembly {
+            return(add(result, 0x20), mload(result))
         }
     }
 
@@ -183,24 +240,23 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         // 2. instead of packing 20 bytes in userOp.signature for enable mode to provide the validator address, v3 uses userOp.nonce[2:22]
         // 3. In v2, only 1 plugin validator(aside from root validator) can access the selector.
         //    In v3, you can use more than 1 plugin to use the exact selector, you need to specify the validator address in userOp.nonce[2:22] to use the validator
-
         (ValidationMode vMode, ValidationType vType, ValidationId vId) = ValidatorLib.decodeNonce(userOp.nonce);
         if (vType == VALIDATION_TYPE_ROOT) {
             vId = vs.rootValidator;
         }
-        validationData = _doValidation(vMode, vId, userOp, userOpHash);
+        validationData = _validateUserOp(vMode, vId, userOp, userOpHash);
         ValidationConfig memory vc = vs.validationConfig[vId];
         // allow when nonce is not revoked or vType is sudo
         if (vType != VALIDATION_TYPE_ROOT && vc.nonce < vs.validNonceFrom) {
             revert InvalidNonce();
         }
         IHook execHook = vc.hook;
-        if (address(execHook) == address(0)) {
+        if (address(execHook) == HOOK_MODULE_NOT_INSTALLED && vType != VALIDATION_TYPE_ROOT) {
             revert InvalidValidator();
         }
         executionHook[userOpHash] = execHook;
 
-        if (address(execHook) == address(1)) {
+        if (address(execHook) == HOOK_MODULE_INSTALLED || address(execHook) == HOOK_MODULE_NOT_INSTALLED) {
             // does not require hook
             if (vType != VALIDATION_TYPE_ROOT && !vs.allowedSelectors[vId][bytes4(userOp.callData[0:4])]) {
                 revert InvalidValidator();
@@ -223,6 +279,10 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         }
     }
 
+    function isValidSignature(bytes32 hash, bytes calldata data) external view returns (bytes4) {
+        return _verifySignature(hash, data);
+    }
+
     // --- Execution ---
     function executeUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
         external
@@ -232,15 +292,17 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
     {
         bytes memory context;
         IHook hook = executionHook[userOpHash];
-        if (address(hook) != address(1)) {
+        bool callHook = address(hook) != HOOK_MODULE_INSTALLED;
+        if (callHook) {
             // removed 4bytes selector
             context = _doPreHook(hook, msg.value, userOp.callData[4:]);
         }
         (bool success, bytes memory ret) = ExecLib.executeDelegatecall(address(this), userOp.callData[4:]);
-        if (address(hook) != address(1)) {
-            _doPostHook(hook, context, success, ret);
-        } else if (!success) {
+        if (!success) {
             revert ExecutionReverted();
+        }
+        if (callHook) {
+            _doPostHook(hook, context);
         }
     }
 
@@ -251,43 +313,22 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
     {
         // no modifier needed, checking if msg.sender is registered executor will replace the modifier
         IHook hook = _executorConfig(IExecutor(msg.sender)).hook;
-        if (address(hook) == address(0)) {
+        if (address(hook) == HOOK_MODULE_NOT_INSTALLED) {
             revert InvalidExecutor();
         }
         bytes memory context;
-        if (address(hook) != address(1)) {
+        bool callHook = address(hook) != HOOK_MODULE_INSTALLED;
+        if (callHook) {
             context = _doPreHook(hook, msg.value, msg.data);
         }
         returnData = ExecLib.execute(execMode, executionCalldata);
-        if (address(hook) != address(1)) {
-            _doPostHook(hook, context, true, abi.encode(returnData));
+        if (callHook) {
+            _doPostHook(hook, context);
         }
     }
 
     function execute(ExecMode execMode, bytes calldata executionCalldata) external payable onlyEntryPointOrSelfOrRoot {
         ExecLib.execute(execMode, executionCalldata);
-    }
-
-    function isValidSignature(bytes32 hash, bytes calldata signature) external view override returns (bytes4) {
-        ValidationStorage storage vs = _validationStorage();
-        (ValidationId vId, bytes calldata sig) = ValidatorLib.decodeSignature(signature);
-        if (ValidatorLib.getType(vId) == VALIDATION_TYPE_ROOT) {
-            vId = vs.rootValidator;
-        }
-        if (address(vs.validationConfig[vId].hook) == address(0)) {
-            revert InvalidValidator();
-        }
-        if (ValidatorLib.getType(vId) == VALIDATION_TYPE_VALIDATOR) {
-            IValidator validator = ValidatorLib.getValidator(vId);
-            return validator.isValidSignatureWithSender(msg.sender, _toWrappedHash(hash), sig);
-        } else {
-            PermissionId pId = ValidatorLib.getPermissionId(vId);
-            PassFlag permissionFlag = vs.permissionConfig[pId].permissionFlag;
-            if (PassFlag.unwrap(permissionFlag) & PassFlag.unwrap(SKIP_SIGNATURE) != 0) {
-                revert PermissionNotAlllowedForSignature();
-            }
-            return _checkPermissionSignature(pId, msg.sender, hash, sig);
-        }
     }
 
     function installModule(uint256 moduleType, address module, bytes calldata initData)
@@ -299,61 +340,57 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         if (moduleType == MODULE_TYPE_VALIDATOR) {
             ValidationStorage storage vs = _validationStorage();
             ValidationId vId = ValidatorLib.validatorToIdentifier(IValidator(module));
+            if (vs.validationConfig[vId].nonce == vs.currentNonce) {
+                // only increase currentNonce when vId's currentNonce is same
+                unchecked {
+                    vs.currentNonce++;
+                }
+            }
             ValidationConfig memory config =
                 ValidationConfig({nonce: vs.currentNonce, hook: IHook(address(bytes20(initData[0:20])))});
-            bytes calldata validatorData;
-            bytes calldata hookData;
+            InstallValidatorDataFormat calldata data;
             assembly {
-                validatorData.offset := add(add(initData.offset, 52), calldataload(add(initData.offset, 20)))
-                validatorData.length := calldataload(sub(validatorData.offset, 32))
-                hookData.offset := add(add(initData.offset, 52), calldataload(add(initData.offset, 52)))
-                hookData.length := calldataload(sub(hookData.offset, 32))
+                data := add(initData.offset, 20)
             }
-            _installValidation(vId, config, validatorData, hookData);
-            //_installHook(config.hook, hookData); hook install is handled inside installvalidation
+            _installValidation(vId, config, data.validatorData, data.hookData);
+            if (data.selectorData.length == 4) {
+                // NOTE: we don't allow configure on selector data on v3.1+, but using bytes instead of bytes4 for selector data to make sure we are future proof
+                _grantAccess(vId, bytes4(data.selectorData[0:4]), true);
+            }
         } else if (moduleType == MODULE_TYPE_EXECUTOR) {
-            bytes calldata executorData;
-            bytes calldata hookData;
+            InstallExecutorDataFormat calldata data;
             assembly {
-                executorData.offset := add(add(initData.offset, 52), calldataload(add(initData.offset, 20)))
-                executorData.length := calldataload(sub(executorData.offset, 32))
-                hookData.offset := add(add(initData.offset, 52), calldataload(add(initData.offset, 52)))
-                hookData.length := calldataload(sub(hookData.offset, 32))
+                data := add(initData.offset, 20)
             }
             IHook hook = IHook(address(bytes20(initData[0:20])));
-            _installExecutor(IExecutor(module), executorData, hook);
-            _installHook(hook, hookData);
+            _installExecutor(IExecutor(module), data.executorData, hook);
+            _installHook(hook, data.hookData);
         } else if (moduleType == MODULE_TYPE_FALLBACK) {
-            bytes calldata selectorData;
-            bytes calldata hookData;
+            InstallFallbackDataFormat calldata data;
             assembly {
-                selectorData.offset := add(add(initData.offset, 56), calldataload(add(initData.offset, 24)))
-                selectorData.length := calldataload(sub(selectorData.offset, 32))
-                hookData.offset := add(add(initData.offset, 56), calldataload(add(initData.offset, 56)))
-                hookData.length := calldataload(sub(hookData.offset, 32))
+                data := add(initData.offset, 24)
             }
-            _installSelector(bytes4(initData[0:4]), module, IHook(address(bytes20(initData[4:24]))), selectorData);
-            _installHook(IHook(address(bytes20(initData[4:24]))), hookData);
-        } else if (moduleType == MODULE_TYPE_HOOK) {
-            // force call onInstall for hook
-            // NOTE: for hook, kernel does not support independant hook install,
+            _installSelector(bytes4(initData[0:4]), module, IHook(address(bytes20(initData[4:24]))), data.selectorData);
+            _installHook(IHook(address(bytes20(initData[4:24]))), data.hookData);
+        } else if (
+            moduleType == MODULE_TYPE_HOOK || moduleType == MODULE_TYPE_POLICY || moduleType == MODULE_TYPE_SIGNER
+        ) {
+            // force call onInstall for hook, policy, signer
+            // NOTE: for hook, kernel does not support independent hook install,
+            // NOTE: for policy, kernel does not support independent policy install,
+            // NOTE: for signer, kernel does not support independent signer install,
             // hook is expected to be paired with proper validator/executor/selector
-            IHook(module).onInstall(initData);
-        } else if (moduleType == MODULE_TYPE_POLICY) {
-            // force call onInstall for policy
-            // NOTE: for policy, kernel does not support independant policy install,
             // policy is expected to be paired with proper permissionId
             // to "ADD" permission, use "installValidations()" function
-            IPolicy(module).onInstall(initData);
-        } else if (moduleType == MODULE_TYPE_SIGNER) {
-            // force call onInstall for signer
-            // NOTE: for signer, kernel does not support independant signer install,
-            // signer is expected to be paired with proper permissionId
-            // to "ADD" permission, use "installValidations()" function
-            ISigner(module).onInstall(initData);
+            IHook(module).onInstall(initData);
         } else {
             revert InvalidModuleType();
         }
+        emit ModuleInstalled(moduleType, module);
+    }
+
+    function grantAccess(ValidationId vId, bytes4 selector, bool allow) external payable onlyEntryPointOrSelfOrRoot {
+        _grantAccess(vId, selector, allow);
     }
 
     function installValidations(
@@ -370,7 +407,18 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         payable
         onlyEntryPointOrSelfOrRoot
     {
-        IHook hook = _uninstallValidation(vId, deinitData);
+        IHook hook = _clearValidationData(vId);
+        ValidationType vType = ValidatorLib.getType(vId);
+        if (vType == VALIDATION_TYPE_VALIDATOR) {
+            IValidator validator = ValidatorLib.getValidator(vId);
+            ModuleLib.uninstallModule(address(validator), deinitData);
+            emit IERC7579Account.ModuleUninstalled(MODULE_TYPE_VALIDATOR, address(validator));
+        } else if (vType == VALIDATION_TYPE_PERMISSION) {
+            PermissionId permission = ValidatorLib.getPermissionId(vId);
+            _uninstallPermission(permission, deinitData);
+        } else {
+            revert InvalidValidationType();
+        }
         _uninstallHook(hook, hookDeinitData);
     }
 
@@ -384,26 +432,33 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
         override
         onlyEntryPointOrSelfOrRoot
     {
-        if (moduleType == 1) {
+        if (moduleType == MODULE_TYPE_VALIDATOR) {
             ValidationId vId = ValidatorLib.validatorToIdentifier(IValidator(module));
-            _uninstallValidation(vId, deInitData);
-        } else if (moduleType == 2) {
-            _uninstallExecutor(IExecutor(module), deInitData);
-        } else if (moduleType == 3) {
+            _clearValidationData(vId);
+        } else if (moduleType == MODULE_TYPE_EXECUTOR) {
+            _clearExecutorData(IExecutor(module));
+        } else if (moduleType == MODULE_TYPE_FALLBACK) {
             bytes4 selector = bytes4(deInitData[0:4]);
-            _uninstallSelector(selector, deInitData[4:]);
-        } else if (moduleType == 4) {
+            address target;
+            _clearSelectorData(selector);
+            if (target == address(0)) {
+                return;
+            }
+            if (target != module) {
+                revert InvalidSelector();
+            }
+            deInitData = deInitData[4:];
+        } else if (moduleType == MODULE_TYPE_HOOK) {
             ValidationId vId = _validationStorage().rootValidator;
             if (_validationStorage().validationConfig[vId].hook == IHook(module)) {
                 // when root validator hook is being removed
                 // remove hook on root validator to prevent kernel from being locked
-                _validationStorage().validationConfig[vId].hook = IHook(address(1));
+                _validationStorage().validationConfig[vId].hook = IHook(HOOK_MODULE_INSTALLED);
             }
-            // force call onInstall for hook
-            // NOTE: for hook, kernel does not support independant hook install,
+            // force call onUninstall for hook
+            // NOTE: for hook, kernel does not support independent hook install,
             // hook is expected to be paired with proper validator/executor/selector
-            ModuleLib.uninstallModule(module, deInitData);
-        } else if (moduleType == 5) {
+        } else if (moduleType == MODULE_TYPE_POLICY || moduleType == MODULE_TYPE_SIGNER) {
             ValidationId rootValidator = _validationStorage().rootValidator;
             bytes32 permissionId = bytes32(deInitData[0:32]);
             if (ValidatorLib.getType(rootValidator) == VALIDATION_TYPE_PERMISSION) {
@@ -411,35 +466,22 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
                     revert RootValidatorCannotBeRemoved();
                 }
             }
-            // force call onInstall for policy
-            // NOTE: for policy, kernel does not support independant policy install,
+            // force call onUninstall for policy
+            // NOTE: for policy, kernel does not support independent policy install,
             // policy is expected to be paired with proper permissionId
             // to "REMOVE" permission, use "uninstallValidation()" function
-            ModuleLib.uninstallModule(module, deInitData);
-        } else if (moduleType == 6) {
-            ValidationId rootValidator = _validationStorage().rootValidator;
-            bytes32 permissionId = bytes32(deInitData[0:32]);
-            if (ValidatorLib.getType(rootValidator) == VALIDATION_TYPE_PERMISSION) {
-                if (permissionId == bytes32(PermissionId.unwrap(ValidatorLib.getPermissionId(rootValidator)))) {
-                    revert RootValidatorCannotBeRemoved();
-                }
-            }
-            // force call onInstall for signer
-            // NOTE: for signer, kernel does not support independant signer install,
+            // NOTE: for signer, kernel does not support independent signer install,
             // signer is expected to be paired with proper permissionId
             // to "REMOVE" permission, use "uninstallValidation()" function
-            ModuleLib.uninstallModule(module, deInitData);
         } else {
             revert InvalidModuleType();
         }
+        ModuleLib.uninstallModule(module, deInitData);
+        emit ModuleUninstalled(moduleType, module);
     }
 
     function supportsModule(uint256 moduleTypeId) external pure override returns (bool) {
-        if (moduleTypeId < 7) {
-            return true;
-        } else {
-            return false;
-        }
+        return moduleTypeId < 7;
     }
 
     function isModuleInstalled(uint256 moduleType, address module, bytes calldata additionalContext)
@@ -450,9 +492,9 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
     {
         if (moduleType == MODULE_TYPE_VALIDATOR) {
             return _validationStorage().validationConfig[ValidatorLib.validatorToIdentifier(IValidator(module))].hook
-                != IHook(address(0));
+                != IHook(HOOK_MODULE_NOT_INSTALLED);
         } else if (moduleType == MODULE_TYPE_EXECUTOR) {
-            return address(_executorConfig(IExecutor(module)).hook) != address(0);
+            return address(_executorConfig(IExecutor(module)).hook) != HOOK_MODULE_NOT_INSTALLED;
         } else if (moduleType == MODULE_TYPE_FALLBACK) {
             return _selectorConfig(bytes4(additionalContext[0:4])).target == module;
         } else {
@@ -461,7 +503,7 @@ contract Kernel is IAccount, IAccountExecute, IERC7579Account, ValidationManager
     }
 
     function accountId() external pure override returns (string memory accountImplementationId) {
-        return "kernel.advanced.v0.3.0-beta";
+        return "kernel.advanced.v0.3.3";
     }
 
     function supportsExecutionMode(ExecMode mode) external pure override returns (bool) {

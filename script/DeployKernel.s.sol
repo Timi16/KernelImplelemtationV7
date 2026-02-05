@@ -12,10 +12,10 @@ contract DeployKernel is Script {
         address entrypointAddress = vm.envAddress("ENTRYPOINT_ADDRESS");
         
         console2.log("=== Deployment Configuration ===");
-        console2.log("RPC URL:", vm.rpcUrl("og"));
+        console2.log("RPC URL:", vm.rpcUrl("base_sepolia"));
         console2.log("Deployer address:", vm.addr(deployerPrivateKey));
         console2.log("EntryPoint address:", entrypointAddress);
-        console2.log("");
+
         
         // Start broadcasting transactions
         vm.startBroadcast(deployerPrivateKey);
