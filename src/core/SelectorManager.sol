@@ -3,9 +3,14 @@
 pragma solidity ^0.8.0;
 
 import {IHook, IFallback, IModule} from "../interfaces/IERC7579Modules.sol";
-import {CallType} from "../utils/ExecLib.sol";
-import {SELECTOR_MANAGER_STORAGE_SLOT, CALLTYPE_DELEGATECALL, CALLTYPE_SINGLE} from "../types/Constants.sol";
-import {ModuleLib} from "../utils/ModuleLib.sol";
+import {IERC7579Account} from "../interfaces/IERC7579Account.sol";
+import {CallType} from "../types/Types.sol";
+import {
+    SELECTOR_MANAGER_STORAGE_SLOT,
+    CALLTYPE_DELEGATECALL,
+    CALLTYPE_SINGLE,
+    MODULE_TYPE_FALLBACK
+} from "../types/Constants.sol";
 
 abstract contract SelectorManager {
     error NotSupportedCallType();
@@ -37,13 +42,14 @@ abstract contract SelectorManager {
 
     function _installSelector(bytes4 selector, address target, IHook hook, bytes calldata selectorData) internal {
         if (address(hook) == address(0)) {
-            hook = IHook(address(1));
+            hook = IHook(address(0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF));
         }
         SelectorConfig storage ss = _selectorConfig(selector);
         // we are going to install only through call/delegatecall
         CallType callType = CallType.wrap(bytes1(selectorData[0]));
         if (callType == CALLTYPE_SINGLE) {
             IModule(target).onInstall(selectorData[1:]);
+            emit IERC7579Account.ModuleInstalled(MODULE_TYPE_FALLBACK, target);
         } else if (callType != CALLTYPE_DELEGATECALL) {
             // NOTE : we are not going to call onInstall for delegatecall, and we support only CALL & DELEGATECALL
             revert NotSupportedCallType();
@@ -53,12 +59,14 @@ abstract contract SelectorManager {
         ss.callType = callType;
     }
 
-    function _uninstallSelector(bytes4 selector, bytes calldata selectorDeinitData) internal returns (IHook hook) {
+    function _clearSelectorData(bytes4 selector) internal returns (IHook hook, address target) {
         SelectorConfig storage ss = _selectorConfig(selector);
         hook = ss.hook;
         ss.hook = IHook(address(0));
-        ModuleLib.uninstallModule(ss.target, selectorDeinitData);
+        if (ss.callType == CALLTYPE_SINGLE) {
+            target = ss.target; // if callType!=CALLTYPE_SINGLE, don't need to call uninstall
+        }
         ss.target = address(0);
-        ss.callType = CallType.wrap(bytes1(0xff));
+        ss.callType = CallType.wrap(bytes1(0x00));
     }
 }
